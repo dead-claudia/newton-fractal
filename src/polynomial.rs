@@ -2,6 +2,7 @@ use num_complex::Complex32;
 use wasm_bindgen::prelude::*;
 
 use std::arch::wasm32::*;
+use std::mem::transmute;
 use std::ptr::addr_of;
 
 use crate::simd_constants::SimdHelper;
@@ -116,91 +117,108 @@ impl Polynomial {
         z - 1.0 / sum
     }
 
-    #[target_feature(enable = "simd128")]
-    pub unsafe fn simd_newton_method_approx_for_two_numbers(&self, two_z: v128) -> v128 {
-        // let first: (i32, i32) = transmute(*(addr_of!(two_z) as *const u64));
-        // let second: (i32, i32) = transmute(*((addr_of!(two_z) as *const u64).offset(1)));
-        // log!(
-        //     "two_z: {:?}, first: {:?}, second: {:?}",
-        //     two_z,
-        //     first,
-        //     second
-        // );
-        let _res = u64x2(
-            self.simd_newton_method_approx(*(addr_of!(two_z) as *const u64)),
-            self.simd_newton_method_approx(*((addr_of!(two_z) as *const u64).offset(1))),
-        );
-        // log!("_res: {:?}", _res);
-        _res
-    }
-
     // #[inline]
     #[target_feature(enable = "simd128")]
-    pub fn simd_newton_method_approx(&self, z: u64) -> u64 {
-        // In scalar implementation we process only one root at a time.
-        // In simd implementation we process two roots at the same time.
-        // We have f32x4 [A, B, C, D], in which (A, B): re and im parts
-        // of first complex value and (C, D): re and im parts of second
-        // complex value. To get single complex value we need to sum
-        // (A + C, B + D)
+    pub fn simd_newton_method_approx_for_two_numbers(&self, _two_z: v128) -> v128 {
+        // In scalar implementation we approximate only one number at a timer.
+        // When using SIMDs, we approximate two numbers at the same time.
+        // In following comments "z" means either "z1" or "z2".
 
-        let mut _sum = f32x4_splat(0.0);
-        // Pass another root
-        let _z = unsafe { v128_load64_splat(&z) };
+        let mut _sum1 = f32x4_splat(0.0);
+        let mut _sum2 = f32x4_splat(0.0);
+        let (z1, z2): (u64, u64) = unsafe { transmute(_two_z) };
+        let _z1 = u64x2_splat(z1);
+        let _z2 = u64x2_splat(z2);
+        let mut _ans = SimdHelper::F64_NANS;
+        let _ans_addr = addr_of!(_ans) as *mut u64;
+
+        // In scalar implementation we process only one root at a time.
+        // When using SIMDs, we process two roots at the same time.
+        // We have f32x4 [A, B, C, D], in which (A, B): re and im parts
+        // of first complex root and (C, D): re and im parts of second
+        // complex root.
+        // To get single complex value we need to sum (A + C, B + D)
+
         let roots_chunks_iter = self.roots.chunks_exact(2);
         let rem = roots_chunks_iter.remainder();
         for roots_chunk in roots_chunks_iter {
             unsafe {
                 // General formula: sum += 1.0 / (z - root)
                 // 1. Subtraction (z - root)
-                let _diff = f32x4_sub(_z, *(roots_chunk.as_ptr() as *const v128));
 
-                // 1*. Check if difference == 0 <=> z == one of roots
-                let _diff_eq = f64x2_eq(_diff, SimdHelper::F64_ZEROES);
-                if v128_any_true(_diff_eq) {
-                    return z;
+                let _two_roots = *(roots_chunk.as_ptr() as *const v128);
+                let _diff1 = f32x4_sub(_z1, _two_roots);
+                let _diff2 = f32x4_sub(_z2, _two_roots);
+
+                // 1*. Check if difference == 0 <=> z1 or z2 == one of roots
+
+                let _diff_eq1 = f64x2_eq(_diff1, SimdHelper::F64_ZEROES);
+                let _diff_eq2 = f64x2_eq(_diff2, SimdHelper::F64_ZEROES);
+
+                if v128_any_true(_diff_eq1) {
+                    // _ans[0] = z1;
+                    *_ans_addr = z1;
+                }
+                if v128_any_true(_diff_eq2) {
+                    // _ans[1] = z2;
+                    *(_ans_addr.offset(1)) = z2;
                 }
 
                 // 2. Inversion (1.0 / _diff <=> 1.0 / (z - root))
-                let _inversion = SimdHelper::complex_number_inversion(_diff);
+                let _inversion1 = SimdHelper::complex_number_inversion(_diff1);
+                let _inversion2 = SimdHelper::complex_number_inversion(_diff2);
 
                 // 3. Addition (sum += 1.0 / (z - root))
-                _sum = f32x4_add(_sum, _inversion);
+                _sum1 = f32x4_add(_sum1, _inversion1);
+                _sum2 = f32x4_add(_sum2, _inversion2);
             }
         }
+
         // Move second complex values to two first lanes
-        let _sum_shift = i64x2_shuffle::<1, 0>(_sum, _sum);
+        let _sum_shift1 = i64x2_shuffle::<1, 0>(_sum1, _sum1);
+        let _sum_shift2 = i64x2_shuffle::<1, 0>(_sum2, _sum2);
 
         // Process odd root
         if let Some(rem) = rem.get(0) {
             unsafe {
                 // This process is same as the processing of two roots, except second
                 // complex value in vector is equal to 0 <=> vector: [A, B, 0, 0];
-                let _diff = f32x4_sub(_z, v128_load64_zero(addr_of!(*rem) as *const u64));
-                let _diff_eq = f64x2_eq(_diff, SimdHelper::F64_ZEROES);
-                if v128_any_true(_diff_eq) {
-                    return *(rem as *const _ as *const u64);
-                }
-                let _inversion = SimdHelper::complex_number_inversion(_diff);
 
-                _sum = f32x4_add(_sum, _inversion);
+                let _subtrahend = v128_load64_splat(addr_of!(*rem) as *const u64);
+                let _diff1 = f32x4_sub(_z1, _subtrahend);
+                let _diff2 = f32x4_sub(_z2, _subtrahend);
+
+                let _diff_eq1 = f64x2_eq(_diff1, SimdHelper::F64_ZEROES);
+                let _diff_eq2 = f64x2_eq(_diff2, SimdHelper::F64_ZEROES);
+
+                if v128_any_true(_diff_eq1) {
+                    *_ans_addr = z1;
+                }
+                if v128_any_true(_diff_eq2) {
+                    *(_ans_addr.offset(1)) = z2;
+                }
+
+                let _inversion1 = SimdHelper::complex_number_inversion(_diff1);
+                let _inversion2 = SimdHelper::complex_number_inversion(_diff2);
+
+                _sum1 = f32x4_add(_sum1, _inversion1);
+                _sum2 = f32x4_add(_sum2, _inversion2);
             }
         }
 
-        // This gives fancy effect (due to swapped sum indexes):
-        // let sum = Complex32::new(
-        //     f32x4_extract_lane::<0>(_sum) + f32x4_extract_lane::<1>(_sum),
-        //     f32x4_extract_lane::<2>(_sum) + f32x4_extract_lane::<3>(_sum),
-        // );
-
         // Sum first and second complex values
-        _sum = f32x4_add(_sum, _sum_shift);
+        _sum1 = f32x4_add(_sum1, _sum_shift1);
+        _sum2 = f32x4_add(_sum2, _sum_shift2);
 
         // Return value: z - 1.0 / sum
-        unsafe {
-            let _inversion = SimdHelper::complex_number_inversion(_sum);
-            let _sub = f32x4_sub(_z, _inversion);
-            *(addr_of!(_sub) as *const u64)
-        }
+        let _inversion1 = SimdHelper::complex_number_inversion(_sum1);
+        let _inversion2 = SimdHelper::complex_number_inversion(_sum2);
+        let _sub1 = f32x4_sub(_z1, _inversion1);
+        let _sub2 = f32x4_sub(_z2, _inversion2);
+        let _sub = u32x4_shuffle::<0, 1, 4, 5>(_sub1, _sub2);
+
+        let _change_mask = u64x2_eq(_ans, SimdHelper::F64_NANS);
+
+        v128_bitselect(_sub, _ans, _change_mask)
     }
 }
