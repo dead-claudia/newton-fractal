@@ -156,11 +156,9 @@ impl Polynomial {
                 let _diff_eq2 = f64x2_eq(_diff2, SimdHelper::F64_ZEROES);
 
                 if v128_any_true(_diff_eq1) {
-                    // _ans[0] = z1;
                     *_ans_addr = z1;
                 }
                 if v128_any_true(_diff_eq2) {
-                    // _ans[1] = z2;
                     *(_ans_addr.offset(1)) = z2;
                 }
 
